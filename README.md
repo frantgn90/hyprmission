@@ -1,7 +1,7 @@
 # hyprmission
 
-[![CI](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml/badge.svg)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
-[![core coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/frantgn90/hyprmission/badges/coverage.json)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
+[![CI](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
+[![core coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffrantgn90%2Fhyprmission%2Fbadges%2Fcoverage.json)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
 
 A macOS Mission Control-style workspace overview for [Hyprland](https://hypr.land).
 
