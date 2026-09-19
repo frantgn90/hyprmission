@@ -98,11 +98,37 @@ COverview::COverview() {
         },
         nullptr);
     g_pEventLoopManager->addTimer(m_refreshTimer);
+
+    m_liveTimer = makeShared<CEventLoopTimer>(
+        std::nullopt,
+        [this](SP<CEventLoopTimer>, void*) {
+            if (!m_open)
+                return;
+            if (g_cfgLivePreviews && g_cfgLivePreviews->value()) {
+                refresh();
+                g_pHyprRenderer->damageMonitor(m_monitor);
+            }
+            armLiveTimer();
+        },
+        nullptr);
+    g_pEventLoopManager->addTimer(m_liveTimer);
 }
 
 COverview::~COverview() {
-    // the timer's callback lives in this .so - make sure the event loop drops it
+    // the timers' callbacks live in this .so - make sure the event loop drops them
     g_pEventLoopManager->removeTimer(m_refreshTimer);
+    g_pEventLoopManager->removeTimer(m_liveTimer);
+}
+
+void COverview::armLiveTimer() {
+    // while live previews are off, keep polling slowly so turning the option
+    // on (hyprctl reload / hl.config) takes effect without reopening
+    if (!g_cfgLivePreviews || !g_cfgLivePreviews->value()) {
+        m_liveTimer->updateTimeout(std::chrono::milliseconds(250));
+        return;
+    }
+    const auto FPS = std::clamp<Config::INTEGER>(g_cfgLiveFps ? g_cfgLiveFps->value() : 30, 1, 144);
+    m_liveTimer->updateTimeout(std::chrono::microseconds(1000000 / FPS));
 }
 
 Vector2D COverview::cursorPx() const {
@@ -326,6 +352,7 @@ void COverview::open() {
 
     m_open = true;
     g_pHyprRenderer->damageMonitor(m_monitor);
+    armLiveTimer();
 }
 
 void COverview::close() {
@@ -336,12 +363,18 @@ void COverview::close() {
     m_toggleKey.reset();
     m_drag = {};
     m_refreshTimer->updateTimeout(std::nullopt);
+    m_liveTimer->updateTimeout(std::nullopt);
     if (m_monitor)
         g_pHyprRenderer->damageMonitor(m_monitor);
     m_monitor.reset();
 }
 
 bool COverview::captureAll() {
+    // keep framebuffers from the previous capture: with live previews this
+    // runs many times a second, reallocating them every time would be waste
+    std::unordered_map<int64_t, SP<Render::GL::CGLFramebuffer>> oldFbs;
+    for (const auto& p : m_previews)
+        oldFbs[p.workspaceID] = p.fb;
     m_previews.clear();
 
     if (!m_monitor)
@@ -396,8 +429,12 @@ bool COverview::captureAll() {
 
         SPreview preview;
         preview.workspaceID = target->m_id;
-        preview.fb          = makeShared<Render::GL::CGLFramebuffer>("hyprmission-preview");
-        preview.fb->alloc((int)m_monitor->m_pixelSize.x, (int)m_monitor->m_pixelSize.y);
+        if (const auto IT = oldFbs.find(target->m_id); IT != oldFbs.end() && IT->second && IT->second->m_size == m_monitor->m_pixelSize)
+            preview.fb = IT->second;
+        else {
+            preview.fb = makeShared<Render::GL::CGLFramebuffer>("hyprmission-preview");
+            preview.fb->alloc((int)m_monitor->m_pixelSize.x, (int)m_monitor->m_pixelSize.y);
+        }
 
         CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
         if (!g_pHyprRenderer->beginFullFakeRender(m_monitor, fakeDamage, preview.fb))
@@ -421,6 +458,17 @@ bool COverview::captureAll() {
         WS->m_alpha->setValueAndWarp(SV.alphaValue);
         if (SV.alphaGoal != SV.alphaValue)
             *WS->m_alpha = SV.alphaGoal;
+    }
+
+    // Wayland clients only draw when they get frame callbacks, and Hyprland
+    // only sends those to visible workspaces - without this, apps on hidden
+    // workspaces would stay frozen in the live previews.
+    if (g_cfgLivePreviews && g_cfgLivePreviews->value()) {
+        const auto NOW = Time::steadyNow();
+        for (size_t i = 0; i < workspaces.size(); ++i) {
+            if (!saved[i].visible)
+                g_pHyprRenderer->sendFrameEventsToWorkspace(m_monitor, workspaces[i], NOW);
+        }
     }
 
     return !m_previews.empty();

@@ -84,6 +84,10 @@ class COverview {
     // re-snapshot after a drop once Hyprland's move/resize animations settle
     SP<CEventLoopTimer> m_refreshTimer;
 
+    // live previews: re-capture every workspace at plugin:hyprmission:live_fps
+    SP<CEventLoopTimer> m_liveTimer;
+    void                armLiveTimer();
+
     struct {
         bool         pressed = false; // left button down on the main view
         PHLWINDOWREF window;

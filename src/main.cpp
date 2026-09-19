@@ -31,6 +31,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (HASH != CLIENT_HASH)
         throw std::runtime_error("[hyprmission] Version mismatch: plugin was built against a different Hyprland than the one running.");
 
+    g_cfgLivePreviews = makeShared<Config::Values::CBoolValue>("plugin:hyprmission:live_previews", "Keep workspace previews updating while the overview is open", true);
+    g_cfgLiveFps      = makeShared<Config::Values::CIntValue>("plugin:hyprmission:live_fps", "Refresh rate of live previews", 30,
+                                                              Config::Values::SIntValueOptions{.min = 1, .max = 144});
+    HyprlandAPI::addConfigValueV2(PHANDLE, g_cfgLivePreviews);
+    HyprlandAPI::addConfigValueV2(PHANDLE, g_cfgLiveFps);
+
     g_pOverview = std::make_unique<COverview>();
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "hyprmission:toggle", dispatchToggleOverview);

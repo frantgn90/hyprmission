@@ -6,7 +6,7 @@ Toggle it and you get a bar of workspace previews along the top, with the active
 
 ## Features
 
-- **Workspace bar**: centered row of previews of every workspace on the monitor. The active one is outlined in blue.
+- **Workspace bar**: centered row of live previews of every workspace on the monitor. The active one is outlined in blue.
 - **Main view**: the active workspace, scaled to fit the remaining space, keeping its aspect ratio.
 - **Switch workspaces**: click a preview (or select it with ←/→ and press Enter). The overview stays open and the main view follows.
 - **Close**: click the main view (focuses the window you clicked), click or press Enter on the already-active workspace, press Esc, or toggle again.
@@ -51,9 +51,41 @@ Classic `hyprland.conf` (not tested yet):
 bind = SUPER, TAB, hyprmission:toggle,
 ```
 
+## Configuration
+
+Options go in your Hyprland config under `plugin:hyprmission`, and a `hyprctl reload` applies them.
+
+Lua config:
+
+```lua
+hl.config({
+    plugin = {
+        hyprmission = {
+            live_previews = true, -- previews keep updating while the overview is open
+            live_fps      = 30,   -- refresh rate of live previews (1-144)
+        },
+    },
+})
+```
+
+Classic `hyprland.conf`:
+
+```ini
+plugin {
+    hyprmission {
+        live_previews = true
+        live_fps = 30
+    }
+}
+```
+
+| Option          | Type | Default | Description |
+|-----------------|------|---------|-------------|
+| `live_previews` | bool | `true`  | Re-capture every workspace while the overview is open, so previews show what's happening (video, terminals, …). Apps on hidden workspaces keep drawing while it's open. With `false`, previews are snapshots taken on open and after changes. |
+| `live_fps`      | int  | `30`    | How many times per second live previews are refreshed. |
+
 ## Known limitations
 
-- Previews are snapshots taken when the overview opens (and refreshed after a switch or a window move), not live video.
 - No workspace reordering yet.
 - Single monitor only.
 
