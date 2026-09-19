@@ -1,5 +1,8 @@
 # hyprmission
 
+[![CI](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml/badge.svg)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
+[![core coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/frantgn90/hyprmission/badges/coverage.json)](https://github.com/frantgn90/hyprmission/actions/workflows/ci.yml)
+
 A macOS Mission Control-style workspace overview for [Hyprland](https://hypr.land).
 
 Toggle it and you get a bar of workspace previews along the top, with the active workspace shown large underneath. Switch workspaces, move windows between them, and create new ones, with the mouse or the keyboard.
@@ -91,14 +94,30 @@ plugin {
 
 ## Development
 
-`devtools/` has two small Wayland clients used to test the overview without touching the real keyboard or mouse. They aren't part of the plugin:
-
-- `vclick X Y W H move|click|drag ...` uses a virtual pointer (`wlr-virtual-pointer`)
-- `vkey KEYCODE... [-m MODMASK]` uses a virtual keyboard with the default xkb keymap
-
 ```sh
-make -C devtools
+make              # build hyprmission.so
+make test         # unit tests
+make coverage     # unit tests + coverage report in build/ (needs gcovr)
+make integration  # integration tests against a real, nested Hyprland
 ```
+
+The code is split in two layers:
+
+- `src/core/`: the overview's logic as plain C++, with no compositor dependencies. This covers layout, hit testing, coordinate mapping, keyboard selection, the keyboard grab, and the workspace rules.
+- `src/Overview.cpp`: the glue that connects that logic to Hyprland. It captures workspaces, draws the overlay and handles input events.
+
+### Tests
+
+- **Unit tests** (`tests/unit/`, GoogleTest, the framework Hyprland uses for its own tests) cover `src/core/`. They run in CI, and the *core coverage* badge measures them.
+- **Integration tests** (`tests/integration/run.py`) take the same approach as Hyprland's `hyprtester`. They launch a real Hyprland with a test config, load the plugin and drive it: they click, drag and type through a virtual pointer and keyboard, open test windows, and check the results through `hyprctl` and screenshots. This covers the compositor glue (toggle, switching, drag and drop, the keyboard grab, live previews, unloading while open), plus regression tests for bugs found along the way. The run is nested in your Wayland session, like the Hyprland wiki recommends for plugin development, and uses its own runtime dir, so it never touches your real session. It needs a GPU, so it can't run on GitHub's runners. Run it locally before pushing.
+
+`hyprctl hyprmission` prints the overview's state as JSON: whether it's open, the active and selected workspace, and the tile geometry. The integration tests use it, and it's handy for debugging.
+
+`devtools/` has the small Wayland clients the integration tests use. They aren't part of the plugin:
+
+- `vclick X Y W H move|click|drag ...`: a virtual pointer (`wlr-virtual-pointer`).
+- `vkey KEYCODE... [-m MODMASK]`: a virtual keyboard with the default xkb keymap.
+- `testclient [--title T] [--keylog FILE] [--animate] [--color RRGGBB]`: a plain window that can log the keys it receives, or repaint on every frame.
 
 ## License
 

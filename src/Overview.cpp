@@ -17,6 +17,8 @@
 
 #include "Overview.hpp"
 #include "Globals.hpp"
+#include "core/Geometry.hpp"
+#include "core/Selection.hpp"
 
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
@@ -63,29 +65,18 @@ COverview::COverview() {
     });
 
     // This event fires before keybinds are resolved; cancelling it stops both
-    // binds and delivery to the focused client.
+    // binds and delivery to the focused client. Policy lives in CKeyGrab.
     m_keyListener = Event::bus()->m_events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
         if (e.state != WL_KEYBOARD_KEY_STATE_PRESSED) {
-            // only swallow releases whose press we swallowed: releases of keys
-            // held before opening must reach the client or they'd get stuck
-            if (m_swallowed.erase(e.keycode))
-                info.cancelled = true;
+            info.cancelled = m_keys.onRelease(e.keycode) == hm::core::eKeyVerdict::SWALLOW;
             return;
         }
 
-        const uint32_t MODS = g_pInputManager->getModsFromAllKBs();
-
-        if (!m_open) {
-            m_lastPress = {e.keycode, MODS, Time::steadyNow()};
-            return;
+        const auto VERDICT = m_keys.onPress(e.keycode, g_pInputManager->getModsFromAllKBs(), std::chrono::steady_clock::now(), m_open);
+        if (VERDICT == hm::core::eKeyVerdict::SWALLOW) {
+            info.cancelled = true;
+            onKeyAction(hm::core::keyAction(e.keycode));
         }
-
-        if (m_toggleKey && e.keycode == m_toggleKey->first && MODS == m_toggleKey->second)
-            return; // let the bind that opened us run - it toggles us closed
-
-        info.cancelled = true;
-        m_swallowed.insert(e.keycode);
-        onKey(e.keycode);
     });
 
     m_refreshTimer = makeShared<CEventLoopTimer>(
@@ -121,56 +112,33 @@ COverview::~COverview() {
 }
 
 void COverview::armLiveTimer() {
-    // while live previews are off, keep polling slowly so turning the option
-    // on (hyprctl reload / hl.config) takes effect without reopening
-    if (!g_cfgLivePreviews || !g_cfgLivePreviews->value()) {
-        m_liveTimer->updateTimeout(std::chrono::milliseconds(250));
-        return;
-    }
-    const auto FPS = std::clamp<Config::INTEGER>(g_cfgLiveFps ? g_cfgLiveFps->value() : 30, 1, 144);
-    m_liveTimer->updateTimeout(std::chrono::microseconds(1000000 / FPS));
+    const bool LIVE = g_cfgLivePreviews && g_cfgLivePreviews->value();
+    m_liveTimer->updateTimeout(hm::core::liveTimerInterval(LIVE, g_cfgLiveFps ? g_cfgLiveFps->value() : 30));
 }
 
 Vector2D COverview::cursorPx() const {
-    // global logical -> monitor pixel coords
-    return (Pointer::mgr()->position() - m_monitor->m_position) * m_monitor->m_scale;
+    return hm::core::globalToMonitorPx(Pointer::mgr()->position(), m_monitor->m_position, m_monitor->m_scale);
 }
 
-int COverview::tileAt(const Vector2D& px) const {
-    for (size_t i = 0; i < m_previews.size(); ++i) {
-        if (m_previews[i].box.containsPoint(px))
-            return (int)i;
-    }
-    return -1;
-}
-
-CBox COverview::windowBoxInMainView(PHLWINDOW w) const {
-    const CBox     WIN = w->getWindowMainSurfaceBox();
-    const Vector2D REL = (WIN.pos() - m_monitor->m_position) / m_monitor->m_size;
-    const Vector2D SZ  = WIN.size() / m_monitor->m_size;
-    return CBox{m_mainBox.x + REL.x * m_mainBox.w, m_mainBox.y + REL.y * m_mainBox.h, SZ.x * m_mainBox.w, SZ.y * m_mainBox.h};
+std::vector<int64_t> COverview::barIDs() const {
+    std::vector<int64_t> ids;
+    for (const auto& p : m_previews)
+        ids.push_back(p.workspaceID);
+    return ids;
 }
 
 void COverview::onPress() {
-    const Vector2D PX   = cursorPx();
-    const int      TILE = tileAt(PX);
+    const Vector2D PX  = cursorPx();
+    const auto     HIT = hm::core::hitTest(m_layout, PX);
 
-    if (TILE >= 0) {
-        activate(m_previews[TILE].workspaceID);
-        return;
+    switch (HIT.kind) {
+        case hm::core::eHit::TILE: activate(m_previews[HIT.tile].workspaceID); return;
+        case hm::core::eHit::NEW_SLOT: activate(hm::core::NEW_SLOT); return;
+        case hm::core::eHit::NONE: return; // background: ignored on purpose
+        case hm::core::eHit::MAIN: break;
     }
 
-    if (m_newSlotBox.containsPoint(PX)) {
-        activate(NEW_SLOT);
-        return;
-    }
-
-    if (!m_mainBox.containsPoint(PX))
-        return;
-
-    // main view -> global logical coords of the real (hidden) workspace
-    const Vector2D REL    = (PX - m_mainBox.pos()) / m_mainBox.size();
-    const Vector2D GLOBAL = m_monitor->m_position + REL * m_monitor->m_size;
+    const Vector2D GLOBAL = hm::core::mainViewToGlobal(PX, m_layout.main, m_monitor->m_position, m_monitor->m_size);
     const auto     WINDOW = Desktop::viewState()->hitTest().windowAt(GLOBAL, Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
 
     m_drag.pressed = true;
@@ -178,15 +146,14 @@ void COverview::onPress() {
     m_drag.startPx = PX;
     m_drag.moved   = false;
     if (WINDOW)
-        m_drag.ghostBase = windowBoxInMainView(WINDOW);
+        m_drag.ghostBase = hm::core::globalBoxToMainView(WINDOW->getWindowMainSurfaceBox(), m_layout.main, m_monitor->m_position, m_monitor->m_size);
 }
 
 void COverview::onMove() {
     if (!m_drag.pressed || !m_drag.window)
         return;
 
-    const Vector2D PX = cursorPx();
-    if (!m_drag.moved && PX.distance(m_drag.startPx) > 8 * m_monitor->m_scale)
+    if (!m_drag.moved && hm::core::exceedsDragThreshold(m_drag.startPx, cursorPx(), m_monitor->m_scale))
         m_drag.moved = true;
 
     g_pHyprRenderer->damageMonitor(m_monitor);
@@ -216,9 +183,10 @@ void COverview::onRelease() {
 void COverview::dropWindow(PHLWINDOW w, const Vector2D& px) {
     PHLWORKSPACE target;
 
-    if (const int TILE = tileAt(px); TILE >= 0)
-        target = State::workspaceState()->query().id(m_previews[TILE].workspaceID).run();
-    else if (m_newSlotBox.containsPoint(px))
+    const auto   HIT = hm::core::hitTest(m_layout, px);
+    if (HIT.kind == hm::core::eHit::TILE)
+        target = State::workspaceState()->query().id(m_previews[HIT.tile].workspaceID).run();
+    else if (HIT.kind == hm::core::eHit::NEW_SLOT)
         target = nextEmptyWorkspace();
 
     if (!target || target == w->m_workspace)
@@ -232,44 +200,34 @@ void COverview::dropWindow(PHLWINDOW w, const Vector2D& px) {
     m_refreshTimer->updateTimeout(std::chrono::milliseconds(600));
 }
 
-// re-snapshot every workspace and redo the layout, staying open
 void COverview::refresh() {
     captureAll();
-    layout();
-    if (selectedIndex() < 0)
-        m_selectedID = m_activeID;
-}
-
-int COverview::selectedIndex() const {
-    if (m_selectedID == NEW_SLOT)
-        return (int)m_previews.size();
-    for (size_t i = 0; i < m_previews.size(); ++i) {
-        if (m_previews[i].workspaceID == m_selectedID)
-            return (int)i;
-    }
-    return -1;
+    relayout();
+    m_selectedID = hm::core::reconcileSelection(barIDs(), m_selectedID, m_activeID);
 }
 
 PHLWORKSPACE COverview::nextEmptyWorkspace() {
-    for (WORKSPACEID id = 1; id < INT32_MAX; ++id) {
-        const auto WS = State::workspaceState()->query().id(id).run();
-        if (!WS)
-            return State::workspaceState()->create(id, m_monitor->m_id, std::to_string(id), true);
-        if (WS->getWindowCount() == 0 && WS->m_monitor.lock() == m_monitor)
-            return WS;
+    std::vector<hm::core::SWorkspaceInfo> infos;
+    for (const auto& ws : State::workspaceState()->workspacesCopy()) {
+        if (ws && ws->m_id > 0)
+            infos.push_back({ws->m_id, ws->getWindowCount(), ws->m_monitor.lock() == m_monitor});
     }
-    return nullptr;
+
+    const auto ID = hm::core::nextEmptyWorkspaceID(infos);
+    if (const auto WS = State::workspaceState()->query().id(ID).run())
+        return WS;
+    return State::workspaceState()->create(ID, m_monitor->m_id, std::to_string(ID), true);
 }
 
 // Switch to a workspace and keep the overview open (main view follows).
 // Choosing the workspace that is already active closes the overview.
 void COverview::activate(int64_t workspaceID) {
-    if (workspaceID == m_activeID) {
-        close();
-        return;
+    PHLWORKSPACE ws;
+    switch (hm::core::activation(workspaceID, m_activeID)) {
+        case hm::core::eActivation::CLOSE: close(); return;
+        case hm::core::eActivation::CREATE_NEW: ws = nextEmptyWorkspace(); break;
+        case hm::core::eActivation::SWITCH: ws = State::workspaceState()->query().id(workspaceID).run(); break;
     }
-
-    PHLWORKSPACE ws = workspaceID == NEW_SLOT ? nextEmptyWorkspace() : State::workspaceState()->query().id(workspaceID).run();
     if (!ws)
         return;
 
@@ -285,30 +243,38 @@ void COverview::activate(int64_t workspaceID) {
     g_pHyprRenderer->damageMonitor(m_monitor);
 }
 
-void COverview::onKey(uint32_t keycode) {
-    switch (keycode) {
-        case KEY_ESC: close(); return;
-        case KEY_ENTER:
-        case KEY_KPENTER:
-            if (selectedIndex() >= 0)
+void COverview::onKeyAction(hm::core::eKeyAction action) {
+    switch (action) {
+        case hm::core::eKeyAction::CLOSE: close(); return;
+        case hm::core::eKeyAction::ACTIVATE:
+            if (hm::core::selectedIndex(barIDs(), m_selectedID) >= 0)
                 activate(m_selectedID);
             return;
-        case KEY_LEFT:
-        case KEY_RIGHT: {
-            if (m_previews.empty())
-                return;
-            // positions 0..size-1 are workspaces, size is the "+" slot
-            int idx = selectedIndex();
-            if (idx < 0)
-                idx = 0;
-            else
-                idx = std::clamp(idx + (keycode == KEY_RIGHT ? 1 : -1), 0, (int)m_previews.size());
-            m_selectedID = idx == (int)m_previews.size() ? NEW_SLOT : m_previews[idx].workspaceID;
+        case hm::core::eKeyAction::LEFT:
+        case hm::core::eKeyAction::RIGHT:
+            m_selectedID = hm::core::moveSelection(barIDs(), m_selectedID, action == hm::core::eKeyAction::RIGHT ? 1 : -1);
             g_pHyprRenderer->damageMonitor(m_monitor);
             return;
-        }
-        default: return;
+        case hm::core::eKeyAction::NONE: return;
     }
+}
+
+hm::core::SStateSnapshot COverview::snapshot() const {
+    hm::core::SStateSnapshot s;
+    s.open       = m_open;
+    s.active     = m_activeID;
+    s.selected   = m_selectedID;
+    s.workspaces = barIDs();
+    s.dragging   = m_drag.pressed && m_drag.moved;
+    if (m_monitor) {
+        const auto POS   = m_monitor->m_position;
+        const auto SCALE = m_monitor->m_scale;
+        for (const auto& t : m_layout.tiles)
+            s.tiles.push_back(hm::core::monitorPxToGlobalBox(t, POS, SCALE));
+        s.newSlot = hm::core::monitorPxToGlobalBox(m_layout.newSlot, POS, SCALE);
+        s.main    = hm::core::monitorPxToGlobalBox(m_layout.main, POS, SCALE);
+    }
+    return s;
 }
 
 bool COverview::isOpen() const {
@@ -331,12 +297,8 @@ void COverview::open() {
     m_activeID   = m_monitor->activeWorkspaceID();
     m_selectedID = m_activeID;
 
-    // If a keybind is opening us, our key listener saw that very press a
-    // moment ago (listeners run right before binds are resolved). Remember it
-    // so the same combo closes us. Opened any other way (Lua/hyprctl): none.
-    m_toggleKey.reset();
-    if (m_lastPress.keycode && Time::steadyNow() - m_lastPress.at < std::chrono::milliseconds(50))
-        m_toggleKey = std::make_pair(m_lastPress.keycode, m_lastPress.mods);
+    // if a keybind is opening us, remember its combo so it can also close us
+    m_keys.onOpen(std::chrono::steady_clock::now());
 
     if (!captureAll()) {
         HyprlandAPI::addNotification(PHANDLE, "[hyprmission] no workspaces to preview", CHyprColor{1.0, 0.6, 0.2, 1.0}, 3000);
@@ -345,7 +307,7 @@ void COverview::open() {
         return;
     }
 
-    layout();
+    relayout();
 
     if (!m_plusTex)
         m_plusTex = g_pHyprRenderer->renderText("+", CHyprColor{1.0, 1.0, 1.0, 0.55}, (int)(48 * m_monitor->m_scale));
@@ -360,8 +322,9 @@ void COverview::close() {
     m_previews.clear();
     m_activeID   = -1;
     m_selectedID = -1;
-    m_toggleKey.reset();
-    m_drag = {};
+    m_keys.onClose();
+    m_drag   = {};
+    m_layout = {};
     m_refreshTimer->updateTimeout(std::nullopt);
     m_liveTimer->updateTimeout(std::nullopt);
     if (m_monitor)
@@ -372,7 +335,7 @@ void COverview::close() {
 bool COverview::captureAll() {
     // keep framebuffers from the previous capture: with live previews this
     // runs many times a second, reallocating them every time would be waste
-    std::unordered_map<int64_t, SP<Render::GL::CGLFramebuffer>> oldFbs;
+    std::unordered_map<int64_t, SP<Render::IFramebuffer>> oldFbs;
     for (const auto& p : m_previews)
         oldFbs[p.workspaceID] = p.fb;
     m_previews.clear();
@@ -429,12 +392,16 @@ bool COverview::captureAll() {
 
         SPreview preview;
         preview.workspaceID = target->m_id;
+        // same setup as Hyprland's own IHyprRenderer::makeSnapshotFB(). The
+        // image description matters: shadows (and other color-managed passes)
+        // dereference it, a framebuffer without one crashes the compositor.
         if (const auto IT = oldFbs.find(target->m_id); IT != oldFbs.end() && IT->second && IT->second->m_size == m_monitor->m_pixelSize)
             preview.fb = IT->second;
         else {
-            preview.fb = makeShared<Render::GL::CGLFramebuffer>("hyprmission-preview");
-            preview.fb->alloc((int)m_monitor->m_pixelSize.x, (int)m_monitor->m_pixelSize.y);
+            preview.fb = g_pHyprRenderer->createFB("hyprmission-preview");
+            preview.fb->alloc((int)m_monitor->m_pixelSize.x, (int)m_monitor->m_pixelSize.y, DRM_FORMAT_ABGR8888);
         }
+        preview.fb->setImageDescription(m_monitor->workBufferImageDescription());
 
         CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
         if (!g_pHyprRenderer->beginFullFakeRender(m_monitor, fakeDamage, preview.fb))
@@ -476,49 +443,10 @@ bool COverview::captureAll() {
 
 // Boxes are in monitor pixel coordinates: that's what pass elements expect
 // (CRectPassElement::boundingBox() divides by the monitor scale).
-void COverview::layout() {
-    if (m_previews.empty() || !m_monitor)
+void COverview::relayout() {
+    if (!m_monitor)
         return;
-
-    const Vector2D SIZE   = m_monitor->m_transformedSize;
-    const float    SCALE  = m_monitor->m_scale;
-    const float    MARGIN = 32.f * SCALE;
-    const float    GAP    = 24.f * SCALE;
-    const float    ASPECT = SIZE.x / SIZE.y;
-    const int      SLOTS  = (int)m_previews.size() + 1; // + "new workspace" slot
-
-    float tileH = SIZE.y * 0.14f;
-    float tileW = tileH * ASPECT;
-
-    const float availableW = SIZE.x - 2 * MARGIN;
-    float       totalW     = SLOTS * tileW + (SLOTS - 1) * GAP;
-    if (totalW > availableW) {
-        const float FIT = availableW / totalW;
-        tileW *= FIT;
-        tileH *= FIT;
-        totalW = SLOTS * tileW + (SLOTS - 1) * GAP;
-    }
-
-    float       x = (SIZE.x - totalW) / 2.f;
-    const float y = MARGIN;
-
-    for (auto& preview : m_previews) {
-        preview.box = CBox{x, y, tileW, tileH};
-        x += tileW + GAP;
-    }
-    m_newSlotBox = CBox{x, y, tileW, tileH};
-
-    // main area: everything below the bar, active workspace keeps its aspect
-    const float barBottom = y + tileH + MARGIN;
-    const float mainAvailH = SIZE.y - barBottom - MARGIN;
-    const float mainAvailW = SIZE.x - 2 * MARGIN;
-    float       mainW      = mainAvailW;
-    float       mainH      = mainW / ASPECT;
-    if (mainH > mainAvailH) {
-        mainH = mainAvailH;
-        mainW = mainH * ASPECT;
-    }
-    m_mainBox = CBox{(SIZE.x - mainW) / 2.f, barBottom, mainW, mainH};
+    m_layout = hm::core::computeLayout(m_monitor->m_transformedSize, m_monitor->m_scale, m_previews.size());
 }
 
 void COverview::addPassElements() {
@@ -541,7 +469,9 @@ void COverview::addPassElements() {
 
     SP<Render::ITexture> activeTex;
 
-    for (const auto& preview : m_previews) {
+    for (size_t i = 0; i < m_previews.size() && i < m_layout.tiles.size(); ++i) {
+        const auto& preview = m_previews[i];
+        const CBox& BOX     = m_layout.tiles[i];
         if (!preview.fb)
             continue;
 
@@ -549,7 +479,7 @@ void COverview::addPassElements() {
         // both stay visible when they're on the same tile
         if (preview.workspaceID == m_selectedID) {
             CRectPassElement::SRectData sel;
-            sel.box   = preview.box.copy().expand(BORDER * 2.5);
+            sel.box   = BOX.copy().expand(BORDER * 2.5);
             sel.color = CHyprColor{1.0, 1.0, 1.0, 0.9};
             sel.round = ROUND + (int)(BORDER * 2.5);
             pass.add(makeUnique<CRectPassElement>(sel));
@@ -559,14 +489,14 @@ void COverview::addPassElements() {
             activeTex = preview.fb->getTexture();
 
             CRectPassElement::SRectData ring;
-            ring.box   = preview.box.copy().expand(BORDER);
+            ring.box   = BOX.copy().expand(BORDER);
             ring.color = CHyprColor{0.45, 0.65, 1.0, 1.0};
             ring.round = ROUND + (int)BORDER;
             pass.add(makeUnique<CRectPassElement>(ring));
         } else if (preview.workspaceID == m_selectedID) {
             // punch the white back to background so it reads as a ring
             CRectPassElement::SRectData gap;
-            gap.box   = preview.box.copy().expand(BORDER);
+            gap.box   = BOX.copy().expand(BORDER);
             gap.color = CHyprColor{0.05, 0.05, 0.07, 1.0};
             gap.round = ROUND + (int)BORDER;
             pass.add(makeUnique<CRectPassElement>(gap));
@@ -574,27 +504,27 @@ void COverview::addPassElements() {
 
         CTexPassElement::SRenderData tex;
         tex.tex   = preview.fb->getTexture();
-        tex.box   = preview.box;
+        tex.box   = BOX;
         tex.round = ROUND;
         pass.add(makeUnique<CTexPassElement>(std::move(tex)));
     }
 
-    if (m_selectedID == NEW_SLOT) {
+    if (m_selectedID == hm::core::NEW_SLOT) {
         CRectPassElement::SRectData sel;
-        sel.box   = m_newSlotBox.copy().expand(BORDER * 2.5);
+        sel.box   = m_layout.newSlot.copy().expand(BORDER * 2.5);
         sel.color = CHyprColor{1.0, 1.0, 1.0, 0.9};
         sel.round = ROUND + (int)(BORDER * 2.5);
         pass.add(makeUnique<CRectPassElement>(sel));
 
         CRectPassElement::SRectData gap;
-        gap.box   = m_newSlotBox.copy().expand(BORDER);
+        gap.box   = m_layout.newSlot.copy().expand(BORDER);
         gap.color = CHyprColor{0.05, 0.05, 0.07, 1.0};
         gap.round = ROUND + (int)BORDER;
         pass.add(makeUnique<CRectPassElement>(gap));
     }
 
     CRectPassElement::SRectData slot;
-    slot.box   = m_newSlotBox;
+    slot.box   = m_layout.newSlot;
     slot.color = CHyprColor{1.0, 1.0, 1.0, 0.08};
     slot.round = ROUND;
     pass.add(makeUnique<CRectPassElement>(slot));
@@ -603,14 +533,14 @@ void COverview::addPassElements() {
         const Vector2D TS = m_plusTex->m_size;
         CTexPassElement::SRenderData plus;
         plus.tex = m_plusTex;
-        plus.box = CBox{m_newSlotBox.x + (m_newSlotBox.w - TS.x) / 2.f, m_newSlotBox.y + (m_newSlotBox.h - TS.y) / 2.f, TS.x, TS.y};
+        plus.box = CBox{m_layout.newSlot.x + (m_layout.newSlot.w - TS.x) / 2.f, m_layout.newSlot.y + (m_layout.newSlot.h - TS.y) / 2.f, TS.x, TS.y};
         pass.add(makeUnique<CTexPassElement>(std::move(plus)));
     }
 
     if (activeTex) {
         CTexPassElement::SRenderData main;
         main.tex   = activeTex;
-        main.box   = m_mainBox;
+        main.box   = m_layout.main;
         main.round = ROUND;
         pass.add(makeUnique<CTexPassElement>(std::move(main)));
     }
@@ -619,11 +549,12 @@ void COverview::addPassElements() {
         const Vector2D PX = cursorPx();
 
         // highlight the drop target
-        CBox dropBox;
-        if (const int TILE = tileAt(PX); TILE >= 0)
-            dropBox = m_previews[TILE].box;
-        else if (m_newSlotBox.containsPoint(PX))
-            dropBox = m_newSlotBox;
+        CBox       dropBox;
+        const auto HIT = hm::core::hitTest(m_layout, PX);
+        if (HIT.kind == hm::core::eHit::TILE)
+            dropBox = m_layout.tiles[HIT.tile];
+        else if (HIT.kind == hm::core::eHit::NEW_SLOT)
+            dropBox = m_layout.newSlot;
         if (!dropBox.empty()) {
             CRectPassElement::SRectData hl;
             hl.box   = dropBox.copy().expand(BORDER);
@@ -633,11 +564,7 @@ void COverview::addPassElements() {
         }
 
         // ghost of the dragged window, shrunk so it fits a tile, following the cursor
-        CBox ghost = m_drag.ghostBase.copy().translate(PX - m_drag.startPx);
-        if (!m_previews.empty() && ghost.h > m_previews.front().box.h) {
-            const double FIT = m_previews.front().box.h / ghost.h;
-            ghost            = CBox{PX.x - ghost.w * FIT / 2.0, PX.y - ghost.h * FIT / 2.0, ghost.w * FIT, ghost.h * FIT};
-        }
+        const CBox ghost = hm::core::dragGhost(m_drag.ghostBase, m_drag.startPx, PX, m_layout.tiles.empty() ? 0.0 : m_layout.tiles.front().h);
 
         CRectPassElement::SRectData g;
         g.box   = ghost;

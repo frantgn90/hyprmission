@@ -6,6 +6,8 @@
 
 #include <string>
 
+static SP<SHyprCtlCommand> g_stateCommand;
+
 static SDispatchResult dispatchToggleOverview(std::string arg) {
     if (g_pOverview)
         g_pOverview->toggle();
@@ -39,6 +41,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_pOverview = std::make_unique<COverview>();
 
+    // `hyprctl hyprmission`: overview state as JSON (integration tests, debugging)
+    g_stateCommand = HyprlandAPI::registerHyprCtlCommand(PHANDLE,
+                                                         SHyprCtlCommand{
+                                                             .name  = "hyprmission",
+                                                             .exact = true,
+                                                             .fn    = [](eHyprCtlOutputFormat, std::string) { return hm::core::stateToJson(g_pOverview->snapshot()); },
+                                                         });
+
     HyprlandAPI::addDispatcherV2(PHANDLE, "hyprmission:toggle", dispatchToggleOverview);
     HyprlandAPI::addLuaFunction(PHANDLE, "hyprmission", "toggle", luaToggleOverview);
 
@@ -49,6 +59,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pOverview && g_pOverview->isOpen())
         g_pOverview->toggle();
 
+    HyprlandAPI::unregisterHyprCtlCommand(PHANDLE, g_stateCommand);
     HyprlandAPI::removeLuaFunction(PHANDLE, "hyprmission", "toggle");
     HyprlandAPI::removeDispatcher(PHANDLE, "hyprmission:toggle");
 

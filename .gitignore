@@ -4,3 +4,6 @@ devtools/vclick
 devtools/vkey
 devtools/*-client-protocol.h
 devtools/*-protocol.c
+devtools/testclient
+build/
+__pycache__/
