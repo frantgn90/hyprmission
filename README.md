@@ -101,6 +101,8 @@ make coverage     # unit tests + coverage report in build/ (needs gcovr)
 make integration  # integration tests against a real, nested Hyprland
 ```
 
+Notes for contributors are in [`CLAUDE.md`](CLAUDE.md) and [`.claude/skills/`](.claude/skills). They cover how the Hyprland internals the plugin relies on actually behave, the testing setup, the dev loop and upgrading Hyprland. They're written so Claude Code can use them, but they read fine as plain docs.
+
 The code is split in two layers:
 
 - `src/core/`: the overview's logic as plain C++, with no compositor dependencies. This covers layout, hit testing, coordinate mapping, keyboard selection, the keyboard grab, and the workspace rules.
