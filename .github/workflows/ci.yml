@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write # publishes the coverage badge to the `badges` branch
+
+    steps:
+      # Pin every package to the Arch archive snapshot that ships Hyprland
+      # 0.56.2, the version this plugin is built against. Plugins use Hyprland
+      # internals, so the headers must match exactly.
+      - name: Install dependencies (Hyprland 0.56.2 snapshot)
+        run: |
+          echo 'Server=https://archive.archlinux.org/repos/2026/09/10/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+          pacman -Syyuu --noconfirm
+          pacman -S --noconfirm --needed base-devel git hyprland gtest gcovr pkgconf wayland wayland-protocols
+          pacman -Q hyprland hyprutils gtest gcovr
+
+      - uses: actions/checkout@v4
+
+      - name: Build plugin
+        run: make
+
+      - name: Build devtools
+        run: make -C devtools
+
+      - name: Unit tests with coverage
+        run: make coverage
+
+      - name: Coverage summary
+        run: cat build/coverage.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: build/coverage*
+
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PCT=$(python3 -c "import json; print(round(json.load(open('build/coverage.json'))['line_percent']))")
+          if   [ "$PCT" -ge 90 ]; then COLOR=brightgreen
+          elif [ "$PCT" -ge 75 ]; then COLOR=yellowgreen
+          elif [ "$PCT" -ge 60 ]; then COLOR=yellow
+          else COLOR=red; fi
+          mkdir -p /tmp/badges && cd /tmp/badges
+          printf '{"schemaVersion":1,"label":"core coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > coverage.json
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          git commit -qm "coverage: $PCT%"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
