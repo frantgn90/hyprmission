@@ -1,0 +1,11 @@
+[repository]
+name = "hyprmission"
+authors = ["frantgn90"]
+
+[hyprmission]
+description = "macOS Mission Control-style workspace overview"
+authors = ["frantgn90"]
+output = "hyprmission.so"
+build = [
+    "make all"
+]
