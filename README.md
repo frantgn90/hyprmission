@@ -67,3 +67,7 @@ bind = SUPER, TAB, hyprmission:toggle,
 ```sh
 make -C devtools
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
